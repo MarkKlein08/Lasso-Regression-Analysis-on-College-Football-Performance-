@@ -1,0 +1,989 @@
+---
+title: "College Football Performance Analysis"
+output: html_document
+date: "2024-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## FPI Data Scraping
+```{r}
+library(dplyr)
+library(rvest)
+library(stringr)
+library(purrr)
+
+scrape_fpi <- function(season = 2020, stat = "FPI"){
+  
+  current_year <- str_sub(Sys.Date(), 1, 4) %>% as.integer()
+  
+  if (between(season, 2012, current_year) == FALSE)
+  
+  if (!(stat %in% c("FPI", "RESUME", "EFF")) == TRUE)
+  
+  message(glue::glue("Scraping {stat} for {season}"))
+  
+  url_fpi <- glue::glue("https://www.espn.com/college-football/fpi/_/view/fpi/season/{season}")
+  url_resume <- glue::glue("https://www.espn.com/college-football/fpi/_/view/resume/season/{season}")
+  url_eff <- glue::glue("https://www.espn.com/college-football/fpi/_/view/efficiencies/season/{season}")
+  
+  if (stat == "FPI"){
+    fpi_html <- read_html(url_fpi)
+    
+    fpi_names <- c(
+      "team", "conf","w_l", "fpi", "rk", "trend","proj", "proj2", 
+      "proj3", "proj4", "proj5", "proj6", "proj7", "proj8"
+    )
+    
+    trend_data <- fpi_html %>%
+      html_nodes("td:nth-child(4) > div") %>%
+      html_attr("class")
+    
+    table_fpi <- suppressWarnings(
+      fpi_html %>%
+        html_table() %>%
+        cbind.data.frame() %>%
+        set_names(nm = fpi_names) %>%
+        slice(-1) %>%
+        mutate(
+          across(c(fpi), as.double),
+          across(c(rk, trend), as.integer),
+          season = season
+        ) %>%
+        mutate(
+          trend = if_else(
+            trend_data[rk] == "trend negative",
+            as.integer(trend * -1),
+            trend)
+        ) %>%
+        select(season, team, conf, fpi, rk) %>%
+        tibble()
+    )
+    
+    table_fpi
+    
+  } else if (stat == "RESUME"){
+    resume_html <- read_html(url_resume)
+    
+    resume_names <- c(
+      "team", "conf", "sor_rk", "fpi_rk", "ap_cfp_rk", "sos_rk",
+      "rem_sos_rk", "gc_rk", "avgwp_rk"
+    )
+    
+    table_resume <- suppressWarnings(
+      resume_html %>%
+      html_table() %>%
+      cbind.data.frame()  %>%
+      set_names(nm = resume_names) %>%
+      slice(-1)%>%
+      mutate(
+          across(c(sor_rk:avgwp_rk), as.integer),
+          season = season
+        ) %>%
+      select(season, everything()) %>%
+      tibble()
+    
+    ) 
+      table_resume
+    
+    
+  } else if (stat == "EFF"){
+    eff_html <- read_html(url_eff)
+    
+    eff_names <- c(
+      "team", "conf", "eff_ove", "rnk_ove", "eff_off", "rnk_off",
+      "eff_def", "rnk_def", "eff_spe", "rnk_spe"
+    )
+    
+    table_eff <-
+      eff_html %>%
+      html_table() %>%
+      cbind.data.frame() %>%
+      set_names(nm=eff_names) %>%
+      slice(-1) %>%
+      mutate(
+        across(contains("rnk"), as.integer),
+        across(contains("eff"), as.double),
+        season = season
+      ) %>%
+      select(season, everything()) %>%
+      tibble()
+    
+    table_eff
+  }
+  
+}
+```
+
+## Exploratory Data Analysis
+
+```{r}
+library(ggplot2)
+library(scales)
+library(gridExtra)
+library(tidyverse)
+library(dplyr)
+
+expenses <- c( "Other_Expenses", "Excess_Transfers_Back", "Medical", 
+               "Competition_Guarantees_spent", "Recruiting", "Game_Expenses_and_Travel", 
+               "Facilities_and_Equipment", "Coaches_Compensation", 
+               "Support_and_Admin_Compensation_w_Severance", "Athletic_Student_Aid", 
+               "Total_Football_Spending", "Total_Football_Coaching_Salaries" )
+revenues <- c( "Corporate_Sponsorship_Advertising_Licensing", 
+               "Donor_Contributions", "Competition_Guarantees_earned", 
+               "NCAA_Conference_Distributions_Media_Rights_and_Post_Season_Football", 
+               "Ticket_Sales", "Institutional_Government_Support")
+
+metrics <- c("rk", "eff_ove", "rnk_ove", "eff_off", "rnk_off", "eff_def",
+             "rnk_def", "eff_spe", "rnk_spe")
+
+df_fpi_year_off <- read_csv("df_fpi_year_off.csv") %>%
+  select(Data, IPEDS_ID, year, fpi, Total_Expenses, all_of(expenses), Total_Revenues, all_of(revenues)) %>%
+  mutate(ExpRev = Total_Expenses / Total_Revenues,
+         FBExp = Total_Football_Spending / Total_Expenses)
+         
+
+
+# Conference key for looping plots
+Conference_key <- read_csv("Conference_key.csv") 
+
+# Original Data
+df <- read_csv("df_03202024.csv") %>%
+  select(c("Data", "IPEDS_ID", "year", "fpi", "Total_Expenses", all_of(expenses), "Total_Revenues", all_of(revenues))) %>%
+  mutate(ExpRev = Total_Expenses / Total_Revenues,
+         FBExp = Total_Football_Spending / Total_Expenses)
+
+# difference in FPI
+df_delta <- read.csv("deltas_03202024.csv", header = TRUE, row.names = NULL) %>%
+  select(c("Data", "IPEDS_ID", "year", "delta_fpi", "Total_Expenses", all_of(expenses), "Total_Revenues", all_of(revenues))) %>%
+  mutate(ExpRev = Total_Expenses / Total_Revenues,
+         FBExp = Total_Football_Spending / Total_Expenses)
+
+```
+
+### Summary Statistics
+```{r}
+# Boxplot of numerical variables
+df_numeric <- df %>%
+  select(-c(Data, IPEDS_ID, year, fpi, ExpRev, FBExp)) # Exclude non-numeric variables
+
+df_numeric_long <- df_numeric %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value")
+
+ggplot(df_numeric_long, aes(x = Variable, y = Value)) +
+  geom_boxplot(fill = "skyblue", color = "black") +
+  coord_flip() +
+  scale_y_continuous(trans = "log10") +
+  labs(title = "Boxplot of Monetary Variables (Log scale)", y = "$ (log scale)")
+
+# Expenditure of NCAA over time
+# find total expenses grouped by year
+yearly<-df%>%
+  group_by(year)%>%
+  summarize(Total_Rev = sum(Total_Revenues,na.rm=TRUE)/1000000000,
+            Total_Exp=sum(Total_Expenses,na.rm=TRUE)/1000000000)
+
+# get all years except for 2023 (due to no data for that year)
+yearly<-yearly[yearly$year!=2023,]
+
+# line plot of the expenses over time
+ggplot(yearly, aes(x=year, y=Total_Exp))+geom_point()+geom_line()+theme_minimal()+labs(x="Year",y="Total Expenditure (Billions)",title = "Total NCAA Football Expenditure Over Time")+scale_x_continuous(breaks = c(2013,2014,2015,2016,2017,2018, 2019, 2020, 2021, 2022), minor_breaks = NULL)
+
+# Top ten spenders and fpi teams
+## find top 10 FPI 2023
+df_23<-df[df$year==2022,]
+df_sorted <- df_23[order(-df_23$fpi), ]
+
+# Select the top 10 rows
+top_10_colleges <- df_sorted[1:10, ]
+
+plot1<-ggplot(top_10_colleges, aes(x=reorder(Data,fpi), y=fpi))+geom_bar(stat = "identity", position = position_dodge())+theme_minimal()+
+  scale_x_discrete(labels = label_wrap(10))+
+  labs(x="NCAA Football Team", y="FPI",title="Top 10 FPI Teams 2022")
+
+## find top 10 expenses
+df_23<-df[df$year==2022,]
+df_sorted <- df_23[order(-df_23$Total_Expenses), ]
+
+# Select the top 10 rows
+top_10_colleges <- df_sorted[1:10, ]
+
+plot2<-ggplot(top_10_colleges, aes(x=reorder(Data,Total_Expenses), y=Total_Expenses))+geom_bar(stat = "identity", position = position_dodge())+theme_minimal()+
+  scale_x_discrete(labels = label_wrap(10))+
+  labs(x="NCAA Football Team", y="Total Expenditure",title="Top 10 Expenditure Teams 2022")
+
+stacked_plot <- grid.arrange(plot1, plot2, nrow = 2)
+stacked_plot
+```
+
+### Line Plots
+```{r}
+# Conferences
+df_plots <- df %>% left_join(Conference_key)
+
+# create Date format year variable
+df_plots <- df_plots %>%
+  mutate(year = as.Date(paste0(year, "-01-01")))
+df_plots <- df_plots %>%
+  mutate(year = as.Date(paste0(year, "-01-01"), format = "%Y-%m-%d"))
+df_plots$year <- format(df_plots$year, "%Y")
+
+FBS <- c("Southeastern Conference", "Pacific-12 Conference",       
+         "Atlantic Coast Conference", "Big Ten Conference","Big 12 Conference")
+plots <- list()
+for (i in 1:length(FBS)){
+  dat <- df_plots %>% filter(FBS_Conference == FBS[i])
+  
+  plots[[i]] <- ggplot(dat, aes(x = year, y = fpi, group = Data, color = Data)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal() +
+    labs(title = paste0(FBS[i], " FPI 2013 - 2022"), y = "FPI")
+}
+```
+
+
+## Ten Year by Year LASSO Models
+```{r}
+library(tidyverse)
+library(glmnet)
+
+expenses <- c( "Other_Expenses", "Excess_Transfers_Back", "Medical", 
+               "Competition_Guarantees_spent", "Recruiting", "Game_Expenses_and_Travel", 
+               "Facilities_and_Equipment", "Coaches_Compensation", 
+               "Support_and_Admin_Compensation_w_Severance", "Athletic_Student_Aid", 
+               "Total_Football_Spending", "Total_Football_Coaching_Salaries" )
+revenues <- c( "Corporate_Sponsorship_Advertising_Licensing", 
+               "Donor_Contributions", "Competition_Guarantees_earned", 
+               "NCAA_Conference_Distributions_Media_Rights_and_Post_Season_Football", 
+               "Ticket_Sales", "Institutional_Government_Support")
+# metrics not including fpi
+metrics <- c("rk", "eff_ove","rnk_ove","eff_off","rnk_off","eff_def",
+             "rnk_def","eff_spe","rnk_spe")
+
+df <- read_csv("df_03202024.csv") %>%
+  dplyr::select(Data, IPEDS_ID, year, fpi, Total_Expenses, all_of(expenses), Total_Revenues, all_of(revenues)) %>%
+  filter(IPEDS_ID != 215293)
+
+# Pivot the data wider - fpi
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year")
+pivot_cols <- setdiff(colnames(df), id_cols)
+
+df_wide <- df %>%
+  pivot_wider(names_from = year,
+              values_from = pivot_cols) %>%
+  dplyr::select(-where(~all(is.na(.))))
+```
+
+### 2013 - 2014
+```{r}
+###### 2013 - 2014 -----------------------------------------------------------------
+# all variables in 2013
+set.seed(0619)
+df_2013 <- df_wide %>%
+  dplyr::select(contains(c("2013", "fpi_2014"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2013[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+### Lasso regression 2013 - 2014 - FPI -----------------------------
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2014")
+var_of_interest <- setdiff(colnames(df_2013), id_cols)
+
+predictors <- scale(as.matrix(df_2013 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2013$fpi_2014
+
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2014 - 2015
+```{r}
+###### 2014 - 2015 -----------------------------------------------------------------
+# all variables in 2014
+df_2014 <- df_wide %>%
+  dplyr::select(contains(c("2014", "fpi_2015"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2014[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2015")
+var_of_interest <- setdiff(colnames(df_2014), id_cols)
+
+predictors <- scale(as.matrix(df_2014 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2014$fpi_2015
+
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2015 - 2016 
+```{r}
+# all variables in 2015
+df_2015 <- df_wide %>%
+  dplyr::select(contains(c("2015", "fpi_2016"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2015[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2016")
+var_of_interest <- setdiff(colnames(df_2015), id_cols)
+
+predictors <- scale(as.matrix(df_2015 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2015$fpi_2016
+
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2016 - 2017
+```{r}
+###### 2016 - 2017 -----------------------------------------------------------------
+# all variables in 2016
+df_2016 <- df_wide %>%
+  dplyr::select(contains(c("2016", "fpi_2017"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2016[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2017")
+var_of_interest <- setdiff(colnames(df_2016), id_cols)
+
+predictors <- scale(as.matrix(df_2016 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2016$fpi_2017
+
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2017 - 2018
+```{r}
+###### 2017 - 2018 -----------------------------------------------------------------
+# all variables in 2017
+df_2017 <- df_wide %>%
+  dplyr::select(contains(c("2017", "fpi_2018"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2017[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2018")
+var_of_interest <- setdiff(colnames(df_2017), id_cols)
+
+predictors <- scale(as.matrix(df_2017 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2017$fpi_2018
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2018-2019
+```{r}
+# all variables in 2018
+df_2018 <- df_wide %>%
+  dplyr::select(contains(c("2018", "fpi_2019"))) %>%
+  filter(complete.cases(.))
+
+# Correlation matrix 
+selected_columns <- df_2018[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2019")
+var_of_interest <- setdiff(colnames(df_2018), id_cols)
+
+predictors <- scale(as.matrix(df_2018 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2018$fpi_2019
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2019 - 2020
+```{r}
+###### 2019 - 2020 -----------------------------------------------------------------
+# all variables in 2019
+df_2019 <- df_wide %>%
+  dplyr::select(contains(c("2019", "fpi_2020"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2019[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2020")
+var_of_interest <- setdiff(colnames(df_2019), id_cols)
+
+predictors <- scale(as.matrix(df_2019 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2019$fpi_2020
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2020 - 2021
+```{r}
+# all variables in 2020
+df_2020 <- df_wide %>%
+  dplyr::select(contains(c("2020", "fpi_2021"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2020[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2021")
+var_of_interest <- setdiff(colnames(df_2020), id_cols)
+
+predictors <- scale(as.matrix(df_2020 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2020$fpi_2021
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2021 - 2022 
+```{r}
+# all variables in 2021
+df_2021 <- df_wide %>%
+  dplyr::select(contains(c("2021", "fpi_2022"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2021[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2022")
+var_of_interest <- setdiff(colnames(df_2021), id_cols)
+
+predictors <- scale(as.matrix(df_2021 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2021$fpi_2022
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### 2022 - 2023
+```{r}
+# all variables in 2022
+df_2022 <- df_wide %>%
+  dplyr::select(contains(c("2022", "fpi_2023"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+# Correlation matrix 
+selected_columns <- df_2022[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("Data", "IPEDS_ID", "FBS_Conference", "year", "fpi_2023")
+var_of_interest <- setdiff(colnames(df_2022), id_cols)
+
+predictors <- scale(as.matrix(df_2022 %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- df_2022$fpi_2023
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+## Final Generalized Lasso Model Process
+```{r}
+raw_data<-read.csv("df_03122024.csv")
+
+vars_of_interest <- raw_data %>%
+  rename(School=Data)%>%
+  select(School, fpi, Recruiting,Total_Football_Spending,
+         Total_Football_Coaching_Salaries,Institutional_Government_Support,
+         Competition_Guarantees_earned,Competition_Guarantees_spent,
+         Donor_Contributions,Other_Expenses,Medical,Ticket_Sales,
+         Athletic_Student_Aid,Coaches_Compensation,Excess_Transfers_Back,
+         NCAA_Conference_Distributions_Media_Rights_and_Post.Season_Football,
+         Game_Expenses_and_Travel) %>%
+  filter_all(all_vars(!is.na(.)))
+
+averaged_data2 <- vars_of_interest %>%
+  group_by(School) %>%
+  summarize(
+    fpi_avg = mean(fpi, na.rm=TRUE),
+    Recruiting_avg = mean(Recruiting, na.rm = TRUE),
+    Total_Football_Spending_avg = mean(Total_Football_Spending, na.rm = TRUE),
+    Total_Football_Coaching_Salaries_avg = mean(Total_Football_Coaching_Salaries, na.rm = TRUE),
+    Institutional_Government_Support_avg = mean(Institutional_Government_Support, na.rm = TRUE),
+    Competition_Guarantees_earned_avg = mean(Competition_Guarantees_earned, na.rm = TRUE),
+    Competition_Guarantees_spent_avg = mean(Competition_Guarantees_spent, na.rm = TRUE),
+    Donor_Contributions_avg = mean(Donor_Contributions, na.rm = TRUE),
+    Other_Expenses_avg = mean(Other_Expenses, na.rm = TRUE),
+    Medical_avg = mean(Medical, na.rm = TRUE),
+    Ticket_Sales_avg = mean(Ticket_Sales, na.rm = TRUE),
+    Athletic_Student_Aid_avg = mean(Athletic_Student_Aid, na.rm = TRUE),
+    Coaches_Compensation_avg = mean(Coaches_Compensation, na.rm = TRUE),
+    Excess_Transfers_Back_avg = mean(Excess_Transfers_Back, na.rm = TRUE),
+    NCAA_Conference_Distributions_Media_Rights_and_Post.Season_Football_avg = mean(NCAA_Conference_Distributions_Media_Rights_and_Post.Season_Football, na.rm = TRUE),
+    Game_Expenses_and_Travel_avg = mean(Game_Expenses_and_Travel, na.rm = TRUE),
+  
+  )
+
+
+df_041124 <- df_wide %>%
+  dplyr::select(contains(c("Data","fpi_2023"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+end_df <- merge(averaged_data2, df_041124, by.x = "School", by.y = "Data", all.x = TRUE) %>% 
+  select(-"School")
+
+# Correlation matrix 
+selected_columns <- end_df[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("fpi_2023")
+var_of_interest <- setdiff(colnames(end_df), id_cols)
+
+predictors <- scale(as.matrix(end_df %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- end_df$fpi_2023
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### LASSO on Predictors where MSE < 30
+```{r}
+raw_data<-read.csv("df_03122024.csv")
+
+vars_of_interest <- df %>%
+  rename(School=Data)%>%
+  select(School, fpi, Recruiting,Total_Football_Spending,
+         Total_Football_Coaching_Salaries,Institutional_Government_Support,
+         Competition_Guarantees_earned, Competition_Guarantees_spent,
+         Other_Expenses, Coaches_Compensation, Excess_Transfers_Back,
+         Game_Expenses_and_Travel) %>%
+  filter_all(all_vars(!is.na(.)))
+
+averaged_data2 <- vars_of_interest %>%
+  group_by(School) %>%
+  summarize(
+    fpi_avg = mean(fpi, na.rm=TRUE),
+    Recruiting_avg = mean(Recruiting, na.rm = TRUE),
+    Total_Football_Spending_avg = mean(Total_Football_Spending, na.rm = TRUE),
+    Total_Football_Coaching_Salaries_avg = mean(Total_Football_Coaching_Salaries, na.rm = TRUE),
+    Institutional_Government_Support_avg = mean(Institutional_Government_Support, na.rm = TRUE),
+    Competition_Guarantees_earned_avg = mean(Competition_Guarantees_earned, na.rm = TRUE),
+    Competition_Guarantees_spent_avg = mean(Competition_Guarantees_spent, na.rm = TRUE),
+    Other_Expenses_avg = mean(Other_Expenses, na.rm = TRUE),
+    Coaches_Compensation_avg = mean(Coaches_Compensation, na.rm = TRUE),
+    Excess_Transfers_Back_avg = mean(Excess_Transfers_Back, na.rm = TRUE),
+    Game_Expenses_and_Travel_avg = mean(Game_Expenses_and_Travel, na.rm = TRUE),
+  )
+
+
+df_041124 <- df_wide %>%
+  dplyr::select(contains(c("Data","fpi_2023"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+end_df <- merge(averaged_data2, df_041124, by.x = "School", by.y = "Data", all.x = TRUE) %>% 
+  select(-"School")
+
+# Correlation matrix 
+selected_columns <- end_df[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("fpi_2023")
+var_of_interest <- setdiff(colnames(end_df), id_cols)
+
+predictors <- scale(as.matrix(end_df %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- end_df$fpi_2023
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### Predictors with MSE < 30 and Avg LASSO Coeff was Highest
+```{r}
+vars_of_interest <- df %>%
+  rename(School=Data)%>%
+  select(School, fpi, Recruiting,Institutional_Government_Support,
+         Other_Expenses) %>%
+  filter_all(all_vars(!is.na(.)))
+
+averaged_data2 <- vars_of_interest %>%
+  group_by(School) %>%
+  summarize(
+    fpi_avg = mean(fpi, na.rm=TRUE),
+    Recruiting_avg = mean(Recruiting, na.rm = TRUE),
+    Institutional_Government_Support_avg = mean(Institutional_Government_Support, na.rm = TRUE),
+    Other_Expenses_avg = mean(Other_Expenses, na.rm = TRUE),
+  )
+
+
+df_041124 <- df_wide %>%
+  dplyr::select(contains(c("Data","fpi_2023"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+end_df <- merge(averaged_data2, df_041124, by.x = "School", by.y = "Data", all.x = TRUE) %>% 
+  select(-"School")
+
+# Correlation matrix 
+selected_columns <- end_df[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("fpi_2023")
+var_of_interest <- setdiff(colnames(end_df), id_cols)
+
+predictors <- scale(as.matrix(end_df %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- end_df$fpi_2023
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+### Using Only Significant Predictors
+```{r}
+set.seed(413619)
+vars_of_interest <- df %>%
+  rename(School=Data)%>%
+  select(School, fpi, Recruiting,Total_Football_Spending,
+         Total_Football_Coaching_Salaries,Institutional_Government_Support,
+         Competition_Guarantees_earned,Competition_Guarantees_spent,
+         Donor_Contributions,Other_Expenses,Medical,Ticket_Sales,
+         Athletic_Student_Aid,Coaches_Compensation,Excess_Transfers_Back,
+         NCAA_Conference_Distributions_Media_Rights_and_Post_Season_Football,
+         Game_Expenses_and_Travel) %>%
+  filter_all(all_vars(!is.na(.)))
+
+averaged_data2 <- vars_of_interest %>%
+  group_by(School) %>%
+  summarize(
+    fpi_avg = mean(fpi, na.rm=TRUE),
+    Recruiting_avg = mean(Recruiting, na.rm = TRUE),
+    Donor_Contributions_avg = mean(Donor_Contributions, na.rm = TRUE),
+    Other_Expenses_avg = mean(Other_Expenses, na.rm = TRUE),
+    Ticket_Sales_avg = mean(Ticket_Sales, na.rm = TRUE),
+  )
+
+
+df_041124 <- df_wide %>%
+  dplyr::select(contains(c("Data","fpi_2023"))) %>%
+  dplyr::select(-where(~ all(is.na(.) | . == 0)))
+
+end_df <- merge(averaged_data2, df_041124, by.x = "School", by.y = "Data", all.x = TRUE) %>% 
+  select(-"School")
+
+# Correlation matrix 
+selected_columns <- end_df[,]
+correlation_matrix <- cor(selected_columns, use = "complete.obs") 
+correlation_df <- as.data.frame(correlation_matrix)
+
+# Preprocess the predictor variables (standardization)
+id_cols <- c("fpi_2023")
+var_of_interest <- setdiff(colnames(end_df), id_cols)
+
+predictors <- scale(as.matrix(end_df %>% dplyr::select(var_of_interest)))
+# Extract the response variable
+fpi <- end_df$fpi_2023
+
+cv <- cv.glmnet(x = predictors, y = fpi, 
+                alpha = 1, 
+                nfolds = 10 )
+
+optimal_lambda <- cv$lambda.min
+
+lasso_model <- glmnet(x = predictors, 
+                      y = fpi, 
+                      alpha = 1, 
+                      lambda = optimal_lambda)
+coef(lasso_model)
+
+predictions <- predict(lasso_model, newx = predictors)
+
+# Calculate performance metrics
+mse <- mean((fpi - predictions)^2)
+mse
+rmse <- sqrt(mse)
+rmse
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
